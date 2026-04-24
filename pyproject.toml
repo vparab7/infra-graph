@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "infra-graph7"
-version = "0.1.2"
+version = "0.2.0"
 description = "Knowledge graph plugin for Terraform, Kubernetes, GitHub Actions, and Docker Compose infrastructure files"
 readme = "README.md"
 requires-python = ">=3.10"

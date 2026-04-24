@@ -178,11 +178,19 @@ node_modules/
 | **ArgoCD** | `.yaml` with `argoproj.io` | AppProjects, Applications, ApplicationSets, cluster generators, `member_of` + `deploys_to` edges |
 | **cert-manager** | `.yaml` with `cert-manager.io` | ClusterIssuers, Issuers, Certificates + `uses_issuer`, `creates_secret` edges |
 | **External Secrets** | `.yaml` with `external-secrets.io` | ExternalSecrets, ClusterSecretStores + `uses_store` edges |
+| **Istio** | `.yaml` with `networking.istio.io` | VirtualServices → Service (`routes_to`), DestinationRules → Service (`configures`) |
+| **Flux CD** | `.yaml` with `*.fluxcd.io` | HelmRelease → HelmRepository/GitRepository (`from_repo`), Kustomization → GitRepository, Alert → Provider |
+| **Argo Rollouts** | `.yaml` with `argoproj.io/v1alpha1 Rollout` | Rollout → Service (`routes_to` canary/stable), Rollout → AnalysisTemplate (`uses_analysis`) |
+| **KEDA** | `.yaml` with `keda.sh` | ScaledObject → Deployment/StatefulSet (`scales`) |
+| **Gateway API** | `.yaml` with `gateway.networking.k8s.io` | HTTPRoute → Gateway (`attached_to`), HTTPRoute → Service (`routes_to`) |
+| **Unknown CRDs** | any `.yaml` with `apiVersion + kind + metadata` | Node created with the custom `kind`; no edges (works with Velero, Crossplane, custom operators, etc.) |
+| **Ansible** | `.yaml` playbooks and task files | Play nodes, role nodes, task file nodes + `uses_role`, `includes_tasks` edges |
 | **GitHub Actions** | `.yml` in `.github/workflows/` | Jobs, steps, `uses:` action refs, `needs:` deps, secret usage |
 | **Docker Compose** | `docker-compose.yml` / `compose.yaml` | Services, volumes, networks, `depends_on` |
 | **Helm** | `Chart.yaml` + `values*.yaml` | Chart metadata, value file override edges |
 | **Helm templates** | `templates/*.yaml` | Go `{{}}` directives auto-stripped; static structure extracted cleanly |
 | **Kustomize** | `kustomization.yaml` | Base/overlay `extends` and `patches` edges |
+| **Generic YAML** | any other `.yml` / `.yaml` | Produces a `config/<filename>` node — nothing is silently dropped |
 
 ---
 
@@ -286,8 +294,9 @@ Claude annotates communities with human-readable names, extracts design rational
 infra_graph/
 ├── parsers/
 │   ├── tf_parser.py          # python-hcl2 + ${} interpolation extractor
-│   ├── yaml_parser.py        # ruamel.yaml + Helm template pre-processor
-│   ├── k8s_schema.py         # K8s + ArgoCD + cert-manager + ESO schemas
+│   ├── yaml_parser.py        # ruamel.yaml + Helm template pre-processor + generic fallback
+│   ├── k8s_schema.py         # K8s + ArgoCD + Istio + Flux + KEDA + Gateway API + any CRD
+│   ├── ansible_schema.py     # Ansible playbook + task file parser
 │   ├── actions_schema.py     # GitHub Actions job/step/uses graph
 │   ├── compose_schema.py     # Docker Compose service graph
 │   └── helm_schema.py        # Helm Chart.yaml + Kustomize overlay detection

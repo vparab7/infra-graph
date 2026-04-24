@@ -7,6 +7,20 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-25
+
+### Added
+
+- **Universal K8s CRD support:** Removed the 29-kind allowlist gate in `k8s_schema.py`. Any YAML document with `apiVersion + kind + metadata` now produces a node — unknown CRDs (Velero, Crossplane, custom operators, etc.) are no longer silently dropped.
+- **Istio:** `VirtualService` → `Service` (`routes_to`), `DestinationRule` → `Service` (`configures`) edge extraction.
+- **Flux CD:** `HelmRelease` → `HelmRepository`/`GitRepository` (`from_repo`), `HelmRelease` → helm chart (`uses_chart`), `Kustomization` → `GitRepository` (`from_repo`), `Alert` → `Provider` (`uses_provider`) edge extraction.
+- **Argo Rollouts:** `Rollout` → `Service` (`routes_to` for canary/stable services), `Rollout` → `AnalysisTemplate` (`uses_analysis`) edge extraction.
+- **KEDA:** `ScaledObject` → `Deployment`/`StatefulSet` (`scales`) edge extraction, mirroring the existing HPA pattern.
+- **Gateway API:** `HTTPRoute` → `Gateway` (`attached_to`), `HTTPRoute` → `Service` (`routes_to`) edge extraction.
+- **Ansible parser** (`ansible_schema.py`): Detects and parses playbooks (play nodes, `uses_role` edges, `includes_tasks` edges) and task files.
+- **Generic YAML fallback:** Any `.yml`/`.yaml` file that doesn't match any known schema now produces a `config/<stem>` node instead of being silently skipped.
+- **27 new tests** in `tests/test_extensions.py` covering all new parsers and the unknown-CRD fallback.
+
 ## [0.1.2] - 2026-04-22
 
 ### Changed
@@ -49,7 +63,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `infra-graph install` for Claude Code, Cursor, Codex, and OpenCode.
 - `/infra-graph` Claude Code skill.
 
-[Unreleased]: https://github.com/vparab7/infra-graph/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/vparab7/infra-graph/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/vparab7/infra-graph/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/vparab7/infra-graph/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/vparab7/infra-graph/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/vparab7/infra-graph/releases/tag/v0.1.0

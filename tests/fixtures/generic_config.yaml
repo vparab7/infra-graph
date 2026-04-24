@@ -1,0 +1,8 @@
+app:
+  name: myservice
+  port: 8080
+database:
+  host: postgres
+  port: 5432
+feature_flags:
+  dark_mode: true

@@ -1,4 +1,10 @@
-"""Kubernetes, ArgoCD, cert-manager, and ExternalSecrets resource parser."""
+"""
+Kubernetes, ArgoCD, cert-manager, ExternalSecrets, Istio, Flux CD,
+Prometheus Operator, Argo Rollouts, KEDA, and Gateway API resource parser.
+
+Any YAML document with apiVersion + kind + metadata produces a node.
+Known kinds receive typed edge extraction; unknown CRDs produce a node only.
+"""
 
 from __future__ import annotations
 
@@ -32,23 +38,73 @@ ESO_KINDS = {
     "PushSecret",
 }
 
-ALL_KNOWN_KINDS = K8S_KINDS | ARGOCD_KINDS | CERTMANAGER_KINDS | ESO_KINDS
+# ── Istio (networking.istio.io / security.istio.io) ───────────────────────────
+ISTIO_KINDS = {
+    "VirtualService", "DestinationRule", "ServiceEntry",
+    "PeerAuthentication", "AuthorizationPolicy", "EnvoyFilter",
+    "Sidecar", "RequestAuthentication", "WorkloadEntry",
+    "Gateway",  # also used by Gateway API; disambiguated by apiVersion in dispatcher
+}
+
+# ── Flux CD (*.toolkit.fluxcd.io) ─────────────────────────────────────────────
+FLUX_KINDS = {
+    "HelmRelease", "HelmRepository", "HelmChart", "GitRepository",
+    "OCIRepository", "Bucket", "Kustomization",
+    "ImageRepository", "ImagePolicy", "ImageUpdateAutomation",
+    "Alert", "Provider", "Receiver",
+}
+
+# ── Prometheus Operator (monitoring.coreos.com) ───────────────────────────────
+PROM_KINDS = {
+    "Prometheus", "PrometheusRule", "ServiceMonitor", "PodMonitor",
+    "Alertmanager", "AlertmanagerConfig", "ThanosRuler",
+}
+
+# ── Argo Rollouts (argoproj.io — shares prefix with ArgoCD) ──────────────────
+ROLLOUTS_KINDS = {"Rollout", "AnalysisTemplate", "AnalysisRun", "Experiment"}
+
+# ── KEDA (keda.sh) ────────────────────────────────────────────────────────────
+KEDA_KINDS = {
+    "ScaledObject", "ScaledJob",
+    "TriggerAuthentication", "ClusterTriggerAuthentication",
+}
+
+# ── Kubernetes Gateway API (gateway.networking.k8s.io) ───────────────────────
+GATEWAY_API_KINDS = {
+    "GatewayClass", "HTTPRoute", "GRPCRoute", "TCPRoute", "TLSRoute", "ReferenceGrant",
+}
+
+# All known kinds — node creation + edge extraction for these; unknown CRDs
+# still get a node (no longer a gate), just no edge extraction.
+ALL_KNOWN_KINDS = (
+    K8S_KINDS | ARGOCD_KINDS | CERTMANAGER_KINDS | ESO_KINDS
+    | ISTIO_KINDS | FLUX_KINDS | PROM_KINDS | ROLLOUTS_KINDS
+    | KEDA_KINDS | GATEWAY_API_KINDS
+)
+
+# ── API group prefix constants for disambiguation ─────────────────────────────
+_ARGOCD_API_PREFIXES = ("argoproj.io",)
+_CERTMANAGER_API_PREFIXES = ("cert-manager.io",)
+_ESO_API_PREFIXES = ("external-secrets.io",)
+_ISTIO_API_PREFIXES = ("networking.istio.io", "security.istio.io", "istio.io")
+_FLUX_API_PREFIXES = (
+    "helm.toolkit.fluxcd.io", "kustomize.toolkit.fluxcd.io",
+    "notification.toolkit.fluxcd.io", "source.toolkit.fluxcd.io",
+    "image.toolkit.fluxcd.io",
+)
+_PROM_API_PREFIXES = ("monitoring.coreos.com",)
+_ROLLOUTS_API_PREFIXES = ("argoproj.io",)
+_KEDA_API_PREFIXES = ("keda.sh",)
+_GATEWAY_API_PREFIXES = ("gateway.networking.k8s.io",)
+
+# Placeholder value injected by the Helm template stripper
+_HELM_PLACEHOLDER = "__helm__"
 
 # Kind → display type (shorten verbose names)
 _KIND_ALIAS: dict[str, str] = {
     "HorizontalPodAutoscaler": "HPA",
     "PersistentVolumeClaim": "PVC",
-    "ClusterExternalSecret": "ClusterExternalSecret",
-    "CertificateRequest": "CertificateRequest",
 }
-
-# API group prefixes that identify ArgoCD resources
-_ARGOCD_API_PREFIXES = ("argoproj.io",)
-_CERTMANAGER_API_PREFIXES = ("cert-manager.io",)
-_ESO_API_PREFIXES = ("external-secrets.io",)
-
-# Placeholder value injected by the Helm template stripper
-_HELM_PLACEHOLDER = "__helm__"
 
 
 def _norm_kind(kind: str) -> str:
@@ -64,11 +120,6 @@ def _get_labels(spec: dict) -> dict[str, str]:
     return {k: v for k, v in raw.items() if isinstance(v, str)}
 
 
-def _is_helm_value(v: Any) -> bool:
-    """True if this value is the Helm placeholder injected by the pre-processor."""
-    return isinstance(v, str) and _HELM_PLACEHOLDER in v
-
-
 def _safe_str(v: Any) -> str | None:
     """Return v as string if it's a meaningful non-placeholder value, else None."""
     if v is None:
@@ -81,13 +132,17 @@ def _safe_str(v: Any) -> str | None:
 
 class KubernetesParser:
     """
-    Parse Kubernetes, ArgoCD, cert-manager, and ESO YAML manifests.
+    Parse Kubernetes, ArgoCD, cert-manager, ESO, Istio, Flux CD,
+    Prometheus Operator, Argo Rollouts, KEDA, and Gateway API manifests.
+
+    Any document with apiVersion + kind + metadata produces a node.
+    Known kinds receive typed edge extraction; unknown CRDs get a node only.
 
     Usage:
         parser = KubernetesParser()
         result = parser.parse_file(path)
-        extra_edges = parser.resolve_selectors()         # call after all files
-        extra_edges += parser.resolve_cluster_selectors()  # call after all files
+        extra_edges = parser.resolve_selectors()          # call after all files
+        extra_edges += parser.resolve_cluster_selectors() # call after all files
     """
 
     def __init__(self) -> None:
@@ -124,19 +179,18 @@ class KubernetesParser:
             kind = doc.get("kind", "") or ""
             if not (api_version and kind):
                 continue
-            if kind not in ALL_KNOWN_KINDS:
-                continue
 
+            # ── Node creation for ALL K8s-style resources ────────────────────
+            # Removed ALL_KNOWN_KINDS gate: unknown CRDs still get a node.
             metadata = doc.get("metadata") or {}
             name = _safe_str(metadata.get("name")) or "unknown"
             namespace = _safe_str(metadata.get("namespace")) or "default"
             node_labels = _get_labels(metadata)
             node_id = _node_id(kind, namespace, name)
 
-            # Extract line number (ruamel.yaml stores it as doc.lc.line, 0-indexed)
             line = None
             try:
-                line = doc.lc.line + 1  # convert to 1-indexed
+                line = doc.lc.line + 1
             except AttributeError:
                 pass
 
@@ -159,7 +213,7 @@ class KubernetesParser:
                 self._label_index[f"{k}={v}"].append(node_id)
 
             spec = doc.get("spec") or {}
-            new_edges = self._extract_edges(kind, node_id, spec, namespace, metadata, doc)
+            new_edges = self._extract_edges(kind, api_version, node_id, spec, namespace, metadata, doc)
             edges.extend(new_edges)
 
         return {"nodes": nodes, "edges": edges}
@@ -169,15 +223,23 @@ class KubernetesParser:
     def _extract_edges(
         self,
         kind: str,
+        api_version: str,
         node_id: str,
         spec: dict,
         namespace: str,
         metadata: dict,
         doc: dict,
     ) -> list[dict]:
+        # ── Core Kubernetes ──────────────────────────────────────────────────
         if kind in ("Deployment", "StatefulSet", "DaemonSet"):
             pod_spec = spec.get("template", {}).get("spec", {}) or {}
             return self._extract_pod_mounts(node_id, pod_spec, namespace)
+
+        if kind == "Service":
+            selector = (spec.get("selector") or {})
+            if selector and isinstance(selector, dict):
+                self.store_selector(node_id, {k: v for k, v in selector.items() if isinstance(v, str)})
+            return []
 
         if kind == "Ingress":
             return self._extract_ingress_edges(node_id, spec, namespace)
@@ -185,6 +247,7 @@ class KubernetesParser:
         if kind == "HorizontalPodAutoscaler":
             return self._extract_hpa_edges(node_id, spec, namespace)
 
+        # ── ArgoCD ──────────────────────────────────────────────────────────
         if kind == "AppProject":
             return self._extract_appproject_edges(node_id, spec, namespace)
 
@@ -194,11 +257,43 @@ class KubernetesParser:
         if kind == "ApplicationSet":
             return self._extract_applicationset_edges(node_id, spec, namespace)
 
+        # ── External Secrets Operator ────────────────────────────────────────
         if kind in ("ExternalSecret", "ClusterExternalSecret"):
             return self._extract_externalsecret_edges(node_id, spec, namespace)
 
+        # ── cert-manager ────────────────────────────────────────────────────
         if kind == "Certificate":
             return self._extract_certificate_edges(node_id, spec, namespace)
+
+        # ── Istio ────────────────────────────────────────────────────────────
+        if kind == "VirtualService" and api_version.startswith(_ISTIO_API_PREFIXES):
+            return self._extract_istio_virtualservice_edges(node_id, spec, namespace)
+
+        if kind == "DestinationRule" and api_version.startswith(_ISTIO_API_PREFIXES):
+            return self._extract_istio_destinationrule_edges(node_id, spec, namespace)
+
+        # ── Flux CD ──────────────────────────────────────────────────────────
+        if kind == "HelmRelease":
+            return self._extract_flux_helmrelease_edges(node_id, spec, namespace)
+
+        if kind == "Kustomization" and api_version.startswith(_FLUX_API_PREFIXES):
+            return self._extract_flux_kustomization_edges(node_id, spec, namespace)
+
+        if kind == "Alert" and api_version.startswith(_FLUX_API_PREFIXES):
+            return self._extract_flux_alert_edges(node_id, spec, namespace)
+
+        # ── Argo Rollouts ────────────────────────────────────────────────────
+        # Disambiguate from ArgoCD using kind name (Rollout is only Argo Rollouts)
+        if kind == "Rollout":
+            return self._extract_rollout_edges(node_id, spec, namespace)
+
+        # ── KEDA ─────────────────────────────────────────────────────────────
+        if kind == "ScaledObject":
+            return self._extract_keda_scaledobject_edges(node_id, spec, namespace)
+
+        # ── Gateway API ──────────────────────────────────────────────────────
+        if kind == "HTTPRoute" and api_version.startswith(_GATEWAY_API_PREFIXES):
+            return self._extract_httproute_edges(node_id, spec, namespace)
 
         return []
 
@@ -286,26 +381,17 @@ class KubernetesParser:
     # ── ArgoCD ────────────────────────────────────────────────────────────────
 
     def _extract_appproject_edges(self, node_id: str, spec: dict, namespace: str) -> list[dict]:
-        """
-        AppProject → cluster destinations (INFERRED: cluster Secrets in argocd namespace).
-        """
         edges = []
         for dest in spec.get("destinations") or []:
             if not isinstance(dest, dict):
                 continue
-            # dest.name matches the cluster Secret's stringData.name
             cluster_name = _safe_str(dest.get("name"))
             if cluster_name and cluster_name != "*":
-                # Cluster Secrets live in the argocd namespace
                 target_id = _node_id("Secret", "argocd", f"argocd-cluster-{cluster_name}")
                 edges.append(self._edge(node_id, target_id, "targets_cluster", 0.7, "INFERRED"))
         return edges
 
     def _extract_application_edges(self, node_id: str, spec: dict, namespace: str) -> list[dict]:
-        """
-        Application → AppProject (member_of), Application → cluster Secret (deploys_to).
-        Handles both spec.source (single) and spec.sources (list, ArgoCD 2.6+).
-        """
         edges = []
         project = _safe_str(spec.get("project"))
         if project:
@@ -319,11 +405,9 @@ class KubernetesParser:
             target_id = _node_id("Secret", "argocd", f"argocd-cluster-{cluster_name}")
             edges.append(self._edge(node_id, target_id, "deploys_to", 0.9, "INFERRED"))
         elif server:
-            # Store dest_server as node attribute for AI context (Bug 5)
             if node_id in self._all_nodes:
                 self._all_nodes[node_id]["dest_server"] = server
 
-        # Handle multi-source: spec.sources (ArgoCD 2.6+)
         sources = spec.get("sources")
         if isinstance(sources, list):
             for source in sources:
@@ -331,17 +415,11 @@ class KubernetesParser:
                     continue
                 chart = _safe_str(source.get("chart"))
                 if chart:
-                    target_id = f"helm_chart/{chart}"
-                    edges.append(self._edge(node_id, target_id, "uses_chart", 1.0, "EXTRACTED"))
-
+                    edges.append(self._edge(node_id, f"helm_chart/{chart}",
+                                            "uses_chart", 1.0, "EXTRACTED"))
         return edges
 
     def _extract_applicationset_edges(self, node_id: str, spec: dict, namespace: str) -> list[dict]:
-        """
-        ApplicationSet → AppProject (member_of via template.spec.project).
-        Cluster selector edges are deferred to resolve_cluster_selectors() (Bug 1 fix).
-        Handles both template.spec.source and template.spec.sources (Bug 2 fix).
-        """
         edges = []
         template = spec.get("template") or {}
         tmpl_spec = template.get("spec") or {}
@@ -350,7 +428,6 @@ class KubernetesParser:
             target_id = _node_id("AppProject", namespace, project)
             edges.append(self._edge(node_id, target_id, "member_of", 1.0, "EXTRACTED"))
 
-        # Handle multi-source in template: spec.template.spec.sources (ArgoCD 2.6+)
         tmpl_sources = tmpl_spec.get("sources")
         if isinstance(tmpl_sources, list):
             for source in tmpl_sources:
@@ -358,10 +435,9 @@ class KubernetesParser:
                     continue
                 chart = _safe_str(source.get("chart"))
                 if chart:
-                    target_id = f"helm_chart/{chart}"
-                    edges.append(self._edge(node_id, target_id, "uses_chart", 1.0, "EXTRACTED"))
+                    edges.append(self._edge(node_id, f"helm_chart/{chart}",
+                                            "uses_chart", 1.0, "EXTRACTED"))
 
-        # Cluster generator selector edges — deferred to post-parse (Bug 1 fix)
         for gen in self._flatten_generators(spec.get("generators") or []):
             clusters_block = gen.get("clusters") or {}
             selector = (clusters_block.get("selector") or {}).get("matchLabels") or {}
@@ -371,13 +447,11 @@ class KubernetesParser:
         return edges
 
     def _flatten_generators(self, generators: list) -> list[dict]:
-        """Recursively flatten matrix/merge generator nesting."""
         flat: list[dict] = []
         for gen in generators:
             if not isinstance(gen, dict):
                 continue
             flat.append(gen)
-            # matrix / merge have nested generators lists
             for nested_key in ("matrix", "merge"):
                 nested = gen.get(nested_key) or {}
                 if isinstance(nested, dict):
@@ -387,13 +461,11 @@ class KubernetesParser:
     # ── External Secrets Operator ─────────────────────────────────────────────
 
     def _extract_externalsecret_edges(self, node_id: str, spec: dict, namespace: str) -> list[dict]:
-        """ExternalSecret → SecretStore / ClusterSecretStore (uses_store)."""
         edges = []
         store_ref = spec.get("secretStoreRef") or {}
         store_name = _safe_str(store_ref.get("name"))
         store_kind = _safe_str(store_ref.get("kind")) or "SecretStore"
         if store_name:
-            # ClusterSecretStore has no namespace
             store_ns = "default" if store_kind == "ClusterSecretStore" else namespace
             target_id = _node_id(store_kind, store_ns, store_name)
             edges.append(self._edge(node_id, target_id, "uses_store", 1.0, "EXTRACTED"))
@@ -402,7 +474,6 @@ class KubernetesParser:
     # ── cert-manager ──────────────────────────────────────────────────────────
 
     def _extract_certificate_edges(self, node_id: str, spec: dict, namespace: str) -> list[dict]:
-        """Certificate → ClusterIssuer/Issuer (uses_issuer), Certificate → Secret (creates_secret)."""
         edges = []
         issuer_ref = spec.get("issuerRef") or {}
         issuer_name = _safe_str(issuer_ref.get("name"))
@@ -417,6 +488,164 @@ class KubernetesParser:
             target_id = _node_id("Secret", namespace, secret_name)
             edges.append(self._edge(node_id, target_id, "creates_secret", 1.0, "EXTRACTED"))
 
+        return edges
+
+    # ── Istio ─────────────────────────────────────────────────────────────────
+
+    def _extract_istio_virtualservice_edges(
+        self, node_id: str, spec: dict, namespace: str
+    ) -> list[dict]:
+        edges = []
+        for proto in ("http", "tcp", "tls"):
+            for route_block in spec.get(proto) or []:
+                if not isinstance(route_block, dict):
+                    continue
+                for route in route_block.get("route") or []:
+                    if not isinstance(route, dict):
+                        continue
+                    dest = route.get("destination") or {}
+                    host = _safe_str(dest.get("host"))
+                    if host:
+                        # Use short name (first DNS label) as Service name
+                        svc_name = host.split(".")[0]
+                        edges.append(self._edge(
+                            node_id,
+                            _node_id("Service", namespace, svc_name),
+                            "routes_to", 1.0, "EXTRACTED",
+                        ))
+        return edges
+
+    def _extract_istio_destinationrule_edges(
+        self, node_id: str, spec: dict, namespace: str
+    ) -> list[dict]:
+        host = _safe_str(spec.get("host"))
+        if host:
+            svc_name = host.split(".")[0]
+            return [self._edge(node_id, _node_id("Service", namespace, svc_name),
+                               "configures", 1.0, "EXTRACTED")]
+        return []
+
+    # ── Flux CD ───────────────────────────────────────────────────────────────
+
+    def _extract_flux_helmrelease_edges(
+        self, node_id: str, spec: dict, namespace: str
+    ) -> list[dict]:
+        edges = []
+        chart_spec = (spec.get("chart") or {}).get("spec") or {}
+        source_ref = chart_spec.get("sourceRef") or {}
+        repo_kind = _safe_str(source_ref.get("kind")) or "HelmRepository"
+        repo_name = _safe_str(source_ref.get("name"))
+        repo_ns = _safe_str(source_ref.get("namespace")) or namespace
+        if repo_name:
+            edges.append(self._edge(
+                node_id,
+                _node_id(repo_kind, repo_ns, repo_name),
+                "from_repo", 1.0, "EXTRACTED",
+            ))
+        chart_name = _safe_str(chart_spec.get("chart"))
+        if chart_name:
+            edges.append(self._edge(node_id, f"helm_chart/{chart_name}",
+                                    "uses_chart", 1.0, "EXTRACTED"))
+        return edges
+
+    def _extract_flux_kustomization_edges(
+        self, node_id: str, spec: dict, namespace: str
+    ) -> list[dict]:
+        source_ref = spec.get("sourceRef") or {}
+        repo_kind = _safe_str(source_ref.get("kind")) or "GitRepository"
+        repo_name = _safe_str(source_ref.get("name"))
+        repo_ns = _safe_str(source_ref.get("namespace")) or namespace
+        if repo_name:
+            return [self._edge(
+                node_id,
+                _node_id(repo_kind, repo_ns, repo_name),
+                "from_repo", 1.0, "EXTRACTED",
+            )]
+        return []
+
+    def _extract_flux_alert_edges(
+        self, node_id: str, spec: dict, namespace: str
+    ) -> list[dict]:
+        provider_ref = spec.get("providerRef") or {}
+        provider_name = _safe_str(provider_ref.get("name"))
+        if provider_name:
+            return [self._edge(
+                node_id,
+                _node_id("Provider", namespace, provider_name),
+                "uses_provider", 1.0, "EXTRACTED",
+            )]
+        return []
+
+    # ── Argo Rollouts ─────────────────────────────────────────────────────────
+
+    def _extract_rollout_edges(
+        self, node_id: str, spec: dict, namespace: str
+    ) -> list[dict]:
+        edges = []
+        canary = (spec.get("strategy") or {}).get("canary") or {}
+        for svc_key in ("stableService", "canaryService"):
+            svc_name = _safe_str(canary.get(svc_key))
+            if svc_name:
+                edges.append(self._edge(
+                    node_id, _node_id("Service", namespace, svc_name),
+                    "routes_to", 1.0, "EXTRACTED",
+                ))
+        for step in canary.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            for tmpl in (step.get("analysis") or {}).get("templates") or []:
+                if not isinstance(tmpl, dict):
+                    continue
+                tmpl_name = _safe_str(tmpl.get("templateName"))
+                if tmpl_name:
+                    edges.append(self._edge(
+                        node_id, _node_id("AnalysisTemplate", namespace, tmpl_name),
+                        "uses_analysis", 1.0, "EXTRACTED",
+                    ))
+        return edges
+
+    # ── KEDA ──────────────────────────────────────────────────────────────────
+
+    def _extract_keda_scaledobject_edges(
+        self, node_id: str, spec: dict, namespace: str
+    ) -> list[dict]:
+        target = spec.get("scaleTargetRef") or {}
+        target_kind = _norm_kind(_safe_str(target.get("kind")) or "Deployment")
+        target_name = _safe_str(target.get("name"))
+        if target_kind and target_name:
+            return [self._edge(node_id, _node_id(target_kind, namespace, target_name),
+                               "scales", 1.0, "EXTRACTED")]
+        return []
+
+    # ── Gateway API ───────────────────────────────────────────────────────────
+
+    def _extract_httproute_edges(
+        self, node_id: str, spec: dict, namespace: str
+    ) -> list[dict]:
+        edges = []
+        for parent in spec.get("parentRefs") or []:
+            if not isinstance(parent, dict):
+                continue
+            gw_name = _safe_str(parent.get("name"))
+            gw_ns = _safe_str(parent.get("namespace")) or namespace
+            if gw_name:
+                edges.append(self._edge(
+                    node_id, _node_id("Gateway", gw_ns, gw_name),
+                    "attached_to", 1.0, "EXTRACTED",
+                ))
+        for rule in spec.get("rules") or []:
+            if not isinstance(rule, dict):
+                continue
+            for backend in rule.get("backendRefs") or []:
+                if not isinstance(backend, dict):
+                    continue
+                svc_name = _safe_str(backend.get("name"))
+                svc_ns = _safe_str(backend.get("namespace")) or namespace
+                if svc_name:
+                    edges.append(self._edge(
+                        node_id, _node_id("Service", svc_ns, svc_name),
+                        "routes_to", 1.0, "EXTRACTED",
+                    ))
         return edges
 
     # ── Selector resolution (cross-file, called after all files parsed) ────────
@@ -436,10 +665,6 @@ class KubernetesParser:
         return extra_edges
 
     def resolve_cluster_selectors(self) -> list[dict]:
-        """
-        Post-parse resolution of ApplicationSet cluster generator selectors (Bug 1 fix).
-        Called after all files are parsed so the label index is fully populated.
-        """
         extra_edges: list[dict] = []
         for node_id, selector, namespace in self._pending_cluster_selectors:
             for label_k, label_v in selector.items():

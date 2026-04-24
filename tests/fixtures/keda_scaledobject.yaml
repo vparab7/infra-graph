@@ -1,0 +1,16 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: myapp-scaler
+  namespace: default
+spec:
+  scaleTargetRef:
+    kind: Deployment
+    name: myapp
+  minReplicaCount: 1
+  maxReplicaCount: 20
+  triggers:
+    - type: kafka
+      metadata:
+        topic: my-topic
+        bootstrapServers: kafka:9092

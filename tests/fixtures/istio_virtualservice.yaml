@@ -1,0 +1,17 @@
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: myapp-vs
+  namespace: default
+spec:
+  hosts:
+    - myapp-svc
+  http:
+    - match:
+        - uri:
+            prefix: /api
+      route:
+        - destination:
+            host: myapp-svc
+            port:
+              number: 8080

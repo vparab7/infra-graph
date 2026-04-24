@@ -1,0 +1,13 @@
+---
+- name: Deploy web servers
+  hosts: webservers
+  roles:
+    - common
+    - nginx
+  tasks:
+    - name: Install curl
+      apt:
+        name: curl
+        state: present
+    - name: Include firewall tasks
+      include_tasks: firewall.yml
