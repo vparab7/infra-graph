@@ -85,5 +85,8 @@ tests/fixtures/infra-graph-out/
 .env.*
 !.env.example
 
+# Local-only scripts (not part of the package)
+infra_graph/viz/obsidian_export.py
+
 # Logs
 *.log
