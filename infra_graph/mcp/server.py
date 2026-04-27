@@ -27,39 +27,66 @@ except ImportError:
 from . import tools as T
 
 _OUT_DIR = "infra-graph-out"
-_GRAPH_FILE = "graph.json"
+_GRAPH_FILE = "graph.toon"
+_GRAPH_FILE_JSON = "graph.json"
 
 
-def _load_graph(project_root: Path) -> nx.DiGraph:
-    """Load the persisted graph from infra-graph-out/graph.json."""
-    graph_path = project_root / _OUT_DIR / _GRAPH_FILE
-    g = nx.DiGraph()
-    if not graph_path.exists():
-        return g
-    try:
-        data = json.loads(graph_path.read_text())
-        for node in data.get("nodes", []):
-            nid = node.pop("id")
-            g.add_node(nid, **node)
-        for edge in data.get("edges", []):
-            frm = edge.pop("from")
-            to = edge.pop("to")
-            g.add_edge(frm, to, **edge)
-    except Exception as exc:
-        import warnings
-        warnings.warn(f"[server] Failed to load graph: {exc}")
-    return g
+def _load_graph(project_root: Path, graph_file: Path | None = None) -> nx.DiGraph:
+    """
+    Load the persisted graph.
+
+    Search order:
+      1. ``graph_file`` if explicitly provided
+      2. ``project_root/infra-graph-out/graph.toon``
+      3. ``project_root/infra-graph-out/graph.json``
+    """
+    import warnings
+
+    from ..graph import toon
+
+    candidates: list[Path] = []
+    if graph_file is not None:
+        candidates.append(graph_file)
+    candidates.append(project_root / _OUT_DIR / _GRAPH_FILE)
+    candidates.append(project_root / _OUT_DIR / _GRAPH_FILE_JSON)
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            if candidate.suffix == ".toon":
+                g, _ = toon.load_graph(candidate)
+                return g
+            # JSON fallback
+            data = json.loads(candidate.read_text())
+            g = nx.DiGraph()
+            for node in data.get("nodes", []):
+                node = dict(node)
+                nid = node.pop("id")
+                g.add_node(nid, **node)
+            for edge in data.get("edges", []):
+                edge = dict(edge)
+                frm = edge.pop("from")
+                to = edge.pop("to")
+                g.add_edge(frm, to, **edge)
+            return g
+        except Exception as exc:
+            warnings.warn(f"[server] Failed to load {candidate}: {exc}")
+
+    return nx.DiGraph()
 
 
-def _reload_graph(project_root: Path, graph: nx.DiGraph) -> nx.DiGraph:
+def _reload_graph(
+    project_root: Path, graph: nx.DiGraph, graph_file: Path | None = None
+) -> nx.DiGraph:
     """Reload graph in-place."""
-    new_graph = _load_graph(project_root)
+    new_graph = _load_graph(project_root, graph_file=graph_file)
     graph.clear()
     graph.update(new_graph)
     return graph
 
 
-def run_server(project_root: Path | None = None) -> None:
+def run_server(project_root: Path | None = None, graph_file: Path | None = None) -> None:
     """Start the MCP stdio server."""
     if not _MCP_AVAILABLE:
         print(
@@ -72,7 +99,7 @@ def run_server(project_root: Path | None = None) -> None:
         project_root = Path.cwd()
 
     # Load graph at startup
-    graph = _load_graph(project_root)
+    graph = _load_graph(project_root, graph_file=graph_file)
 
     server = Server("infra-graph")
 
@@ -236,10 +263,10 @@ def run_server(project_root: Path | None = None) -> None:
         name: str, arguments: dict[str, Any]
     ) -> list[mcp_types.TextContent]:
         # Reload graph before each call to pick up any changes
-        _reload_graph(project_root, graph)
+        _reload_graph(project_root, graph, graph_file=graph_file)
 
         try:
-            result = _dispatch(graph, name, arguments, project_root)
+            result = _dispatch(graph, name, arguments, project_root, graph_file=graph_file)
         except Exception as exc:
             result = {"error": str(exc), "tool": name}
 
@@ -259,6 +286,7 @@ def _dispatch(
     name: str,
     args: dict[str, Any],
     project_root: Path,
+    graph_file: Path | None = None,
 ) -> Any:
     if name == "get_minimal_context":
         return T.get_minimal_context(graph)
@@ -294,7 +322,7 @@ def _dispatch(
         )
         # Reload the graph after build
         if result.get("success"):
-            _reload_graph(project_root, graph)
+            _reload_graph(project_root, graph, graph_file=graph_file)
         return result
     elif name == "search_resources":
         return T.search_resources(graph, query=args["query"])

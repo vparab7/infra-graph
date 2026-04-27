@@ -53,9 +53,15 @@ Fall back to Grep/Glob/Read **only** when the graph doesn't cover what you need.
 """
 
 
-def install(project_root: Path) -> dict[str, str]:
+def install(project_root: Path, federated_graph: Path | None = None) -> dict[str, str]:
     """
     Write .mcp.json and update CLAUDE.md in the given project root.
+
+    Args:
+        project_root: The project directory to install into.
+        federated_graph: Optional path to a federated graph file.  When
+            provided, a second ``"infra-graph-federated"`` entry is written
+            to ``.mcp.json`` pointing at the given file.
 
     Returns a dict of {filename: action} for reporting.
     """
@@ -65,17 +71,27 @@ def install(project_root: Path) -> dict[str, str]:
     # ── .mcp.json ──────────────────────────────────────────────────────────
     mcp_json_path = project_root / ".mcp.json"
     if mcp_json_path.exists():
-        # Merge with existing
         try:
             existing = json.loads(mcp_json_path.read_text())
         except Exception:
             existing = {}
         servers = existing.setdefault("mcpServers", {})
         servers["infra-graph"] = _MCP_JSON["mcpServers"]["infra-graph"]
+        if federated_graph is not None:
+            servers["infra-graph-federated"] = {
+                "command": "infra-graph",
+                "args": ["serve", "--graph", str(federated_graph.resolve())],
+            }
         mcp_json_path.write_text(json.dumps(existing, indent=2) + "\n")
         results[".mcp.json"] = "updated"
     else:
-        mcp_json_path.write_text(json.dumps(_MCP_JSON, indent=2) + "\n")
+        config = dict(_MCP_JSON)
+        if federated_graph is not None:
+            config["mcpServers"]["infra-graph-federated"] = {
+                "command": "infra-graph",
+                "args": ["serve", "--graph", str(federated_graph.resolve())],
+            }
+        mcp_json_path.write_text(json.dumps(config, indent=2) + "\n")
         results[".mcp.json"] = "created"
 
     # ── CLAUDE.md ──────────────────────────────────────────────────────────

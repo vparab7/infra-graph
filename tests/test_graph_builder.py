@@ -75,20 +75,19 @@ def test_gha_jobs_in_graph(builder):
     assert len(job_nodes) >= 2  # build, deploy
 
 
-def test_graph_json_saved(builder):
-    graph_path = builder.out_dir / "graph.json"
+def test_graph_saved(builder):
+    # Default format is TOON
+    graph_path = builder.out_dir / "graph.toon"
     assert graph_path.exists()
-    data = json.loads(graph_path.read_text())
-    assert "nodes" in data
-    assert "edges" in data
-    assert data["meta"]["node_count"] > 0
-
-
-def test_graph_json_human_readable(builder):
-    """Graph JSON should be pretty-printed."""
-    graph_path = builder.out_dir / "graph.json"
     content = graph_path.read_text()
-    # Pretty-printed JSON has newlines
+    assert "nodes[" in content
+    assert "edges[" in content
+
+
+def test_graph_toon_human_readable(builder):
+    """TOON graph should be human-readable with newlines."""
+    graph_path = builder.out_dir / "graph.toon"
+    content = graph_path.read_text()
     assert "\n" in content
 
 

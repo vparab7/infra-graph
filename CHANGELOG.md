@@ -7,6 +7,21 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-27
+
+### Added
+
+- **TOON output format (default):** `graph.toon` replaces `graph.json` as the default build output. TOON (Token-Oriented Object Notation) uses tabular encoding for uniform arrays, reducing graph size by ~40% compared to JSON. Use `infra-graph build . --format json` to opt in to the legacy JSON format. `load_graph` falls back to `.json` automatically if `.toon` is not found, preserving backward compatibility.
+- **Graph federation (`infra-graph federate`):** Merges graphs from multiple repositories into a single cross-repo `federated-graph.toon`. Three resolution strategies are applied in order:
+  - *Exact ID match* — an unknown node in repo A is resolved by a real node in repo B sharing the same node ID.
+  - *Fuzzy/suffix match* — strips known org prefixes and matches on base name + type (e.g. `helm_chart/myapp` resolved to `helm_chart/org-myapp`); resolved edges are tagged `provenance=FEDERATED_FUZZY, confidence=0.7`.
+  - *Attribute/value match* — ArgoCD cluster Secrets (`server_url`) are matched to Terraform `azurerm_kubernetes_cluster` resources and linked via `provisioned_by` edges (`provenance=FEDERATED_INFERRED, confidence=0.6`).
+  - Federation output includes `meta` fields: `unknowns_resolved` and `provisioned_by_edges`.
+- **ArgoCD cluster Secret `server_url` extraction:** When a Kubernetes Secret carries the label `argocd.argoproj.io/secret-type: cluster`, the parser now extracts `server_url` (resolved from `stringData.server` → `spec.server` → base64-decoded `data.server`) and `argocd_cluster_name` as node attributes. These attributes drive the federation attribute-match strategy.
+- **MCP server `--graph` flag:** `infra-graph serve --graph /path/to/any-graph.toon` loads any graph file (local single-repo or federated) directly. The server resolves `.toon` or `.json` format from the file extension.
+- **Dual-graph MCP install:** `infra-graph install --federated /path/to/federated-graph.toon` writes a second MCP server entry (`infra-graph-federated`) alongside the standard `infra-graph` entry. Claude Code discovers both servers and can query either scope.
+- **Terraform output `expression` attribute:** `output` nodes now store the raw HCL `value` expression string as an `expression` attribute, allowing federation to trace cluster FQDN references across repositories.
+
 ## [0.2.0] - 2026-04-25
 
 ### Added
@@ -63,7 +78,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `infra-graph install` for Claude Code, Cursor, Codex, and OpenCode.
 - `/infra-graph` Claude Code skill.
 
-[Unreleased]: https://github.com/vparab7/infra-graph/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/vparab7/infra-graph/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/vparab7/infra-graph/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/vparab7/infra-graph/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/vparab7/infra-graph/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/vparab7/infra-graph/compare/v0.1.0...v0.1.1

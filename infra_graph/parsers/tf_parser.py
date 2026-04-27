@@ -189,6 +189,7 @@ class TerraformParser:
         for out_block in data.get("output", []):
             for out_name_raw, body in out_block.items():
                 out_name = _strip_quotes(out_name_raw)
+                output_body = body if isinstance(body, dict) else {}
                 node_id = f"output.{out_name}"
                 nodes.append(
                     {
@@ -200,6 +201,7 @@ class TerraformParser:
                         "line": None,
                         "labels": {},
                         "community_id": None,
+                        "expression": str(output_body.get("value", "")),
                     }
                 )
                 for expr in _extract_interpolations(body):

@@ -174,7 +174,7 @@ node_modules/
 | Format | Extensions | What gets extracted |
 |--------|-----------|---------------------|
 | **Terraform / HCL** | `.tf` `.hcl` | Resources, modules, variables, outputs, locals, data sources, providers, `${}` interpolations, `depends_on` |
-| **Kubernetes** | `.yaml` `.yml` with `apiVersion` | Deployments, Services, ConfigMaps, Secrets, Ingresses, StatefulSets, DaemonSets, HPAs, PVCs, ServiceAccounts + label→selector edges |
+| **Kubernetes** | `.yaml` `.yml` with `apiVersion` | Deployments, Services, ConfigMaps, Secrets, Ingresses, StatefulSets, DaemonSets, HPAs, PVCs, ServiceAccounts + label→selector edges; ArgoCD cluster Secrets extract `server_url` and `argocd_cluster_name` for cross-repo federation |
 | **ArgoCD** | `.yaml` with `argoproj.io` | AppProjects, Applications, ApplicationSets, cluster generators, `member_of` + `deploys_to` edges |
 | **cert-manager** | `.yaml` with `cert-manager.io` | ClusterIssuers, Issuers, Certificates + `uses_issuer`, `creates_secret` edges |
 | **External Secrets** | `.yaml` with `external-secrets.io` | ExternalSecrets, ClusterSecretStores + `uses_store` edges |
@@ -225,6 +225,76 @@ Use these IDs when calling tools directly:
 | ArgoCD Application | `Application/<namespace>/<name>` | `Application/argocd/frontend` |
 | Compose service | `service/<project>/<name>` | `service/myapp/postgres` |
 | GitHub Actions job | `job/<workflow>/<job_key>` | `job/ci/build` |
+| Generic config file | `config/<filename>` | `config/my-config` |
+| Ansible play | `play/<stem>/<hosts>` | `play/playbook/webservers` |
+
+---
+
+## Graph Federation
+
+Large infrastructure estates are often split across multiple repositories — a `terraform-infra` repo that provisions clusters, a `gitops-config` repo with ArgoCD applications, and a `helm-charts` repo with chart definitions. Each repo builds its own graph. Federation merges them into a single cross-repo view so your AI can answer questions that span repository boundaries.
+
+### How it works
+
+Each repository builds its own `graph.toon` with `infra-graph build`. The `infra-graph federate` command then reads those graphs and resolves unknown references using three strategies (applied in order):
+
+1. **Exact ID match** — an unresolved node in one repo is satisfied by a real node in another repo that shares the same node ID.
+2. **Fuzzy/suffix match** — strips known org prefixes and matches on base name + node type. For example, `helm_chart/myapp` referenced in a GitOps repo is resolved to `helm_chart/org-myapp` in the charts repo; resolved edges are tagged `provenance=FEDERATED_FUZZY, confidence=0.7`.
+3. **Attribute/value match** — ArgoCD cluster Secrets (which now expose a `server_url` attribute) are matched to Terraform `azurerm_kubernetes_cluster` resources. A `provisioned_by` edge is added between them (`provenance=FEDERATED_INFERRED, confidence=0.6`), linking GitOps config to the infrastructure that backs it.
+
+The output is `federated-graph.toon` with federation metadata (`unknowns_resolved`, `provisioned_by_edges`) in the graph `meta` block.
+
+### Usage
+
+```bash
+# Build individual graphs first
+cd /path/to/terraform-infra  && infra-graph build .
+cd /path/to/gitops-config    && infra-graph build .
+cd /path/to/helm-charts      && infra-graph build .
+
+# Merge into a federated graph
+infra-graph federate \
+  /path/to/terraform-infra/graph.toon \
+  /path/to/gitops-config/graph.toon \
+  /path/to/helm-charts/graph.toon \
+  --output ./federated-graph.toon
+```
+
+### Serving the federated graph via MCP
+
+Point the MCP server at any graph file with the `--graph` flag:
+
+```bash
+infra-graph serve --graph ./federated-graph.toon
+```
+
+### Dual-graph install (single-repo + federated)
+
+Register both the per-repo graph and the federated graph as separate MCP servers so Claude Code can query either scope:
+
+```bash
+infra-graph install --federated ./federated-graph.toon
+```
+
+This writes two MCP server entries to `.mcp.json`:
+
+- `infra-graph` — the local single-repo graph (as before)
+- `infra-graph-federated` — the merged cross-repo graph
+
+Claude Code discovers both servers on the next launch and selects the appropriate scope automatically.
+
+---
+
+## Output Format (TOON)
+
+Starting in v0.3.0, `infra-graph build` writes `graph.toon` by default instead of `graph.json`. TOON (Token-Oriented Object Notation) uses tabular encoding for uniform arrays (node lists, edge lists), producing files that are roughly **40% smaller in token count** than equivalent JSON — meaning even loading the full raw graph into an AI context window costs fewer tokens.
+
+```bash
+infra-graph build .                   # writes graph.toon (default)
+infra-graph build . --format json     # opt in to legacy graph.json
+```
+
+`load_graph` automatically falls back to `.json` if `.toon` is not found, so existing workflows continue to work without changes.
 
 ---
 
@@ -232,10 +302,15 @@ Use these IDs when calling tools directly:
 
 ```bash
 # Build the graph
-infra-graph build .                     # full build
+infra-graph build .                     # full build (writes graph.toon by default)
+infra-graph build . --format json       # opt in to legacy graph.json output
 infra-graph build . --update            # incremental (only changed files)
 infra-graph build . --mode deep         # with optional LLM annotation
 infra-graph build . --watch             # auto-rebuild on file saves
+
+# Federate multiple repo graphs
+infra-graph federate repo1/graph.toon repo2/graph.toon repo3/graph.toon \
+  --output ./federated-graph.toon
 
 # Query from the terminal
 infra-graph query "what does aws_instance.web depend on?"
@@ -247,7 +322,8 @@ infra-graph status                      # node / edge / community counts
 infra-graph visualize                   # open interactive vis.js graph in browser
 
 # Server
-infra-graph serve                       # start MCP stdio server manually
+infra-graph serve                       # start MCP stdio server (uses graph.toon)
+infra-graph serve --graph /path/to/federated-graph.toon   # load any graph file
 
 # Install
 infra-graph install                     # auto-detect AI assistant
@@ -255,6 +331,7 @@ infra-graph install --platform claude-code
 infra-graph install --platform cursor
 infra-graph install --platform codex
 infra-graph install --platform opencode
+infra-graph install --federated ./federated-graph.toon    # add dual-graph MCP entry
 ```
 
 ---
@@ -286,6 +363,12 @@ Kubernetes label-selector matching runs as a cross-file sweep: a label inverted 
 **Pass 3 — Optional LLM annotation (`--mode deep`)**
 Claude annotates communities with human-readable names, extracts design rationale from comments, and enriches report summaries. Not required for token savings — the structural graph alone delivers the reduction numbers above.
 
+**Output — TOON serialization**
+After all three passes, the graph is serialized to `graph.toon` using TOON (Token-Oriented Object Notation). Uniform arrays (node lists, edge lists) are encoded in a compact tabular form that is ~40% smaller in token count than equivalent JSON. Use `--format json` to opt in to the legacy format.
+
+**Optional — Federation pass (`infra-graph federate`)**
+Graphs from multiple repositories can be merged into a single `federated-graph.toon` using three resolution strategies: exact node ID match, fuzzy prefix-strip + type match, and attribute/value match (ArgoCD cluster `server_url` → Terraform cluster resource). See [Graph Federation](#graph-federation) for details.
+
 ---
 
 ## Architecture
@@ -304,7 +387,9 @@ infra_graph/
 │   ├── builder.py            # NetworkX DiGraph + SHA-256 file cache
 │   ├── blast_radius.py       # BFS impact traversal
 │   ├── community.py          # Leiden clustering (graspologic) + fallback
-│   └── report.py             # GRAPH_REPORT.md generator
+│   ├── report.py             # GRAPH_REPORT.md generator
+│   ├── toon.py               # TOON serializer/deserializer (default output format)
+│   └── federation.py         # multi-repo graph federation engine
 ├── mcp/
 │   ├── server.py             # MCP stdio server
 │   └── tools.py              # 10 MCP tool implementations

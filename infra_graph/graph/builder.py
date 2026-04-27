@@ -19,7 +19,8 @@ from .community import assign_communities
 
 # Output directory name
 _OUT_DIR = "infra-graph-out"
-_GRAPH_FILE = "graph.json"
+_GRAPH_FILE = "graph.toon"
+_GRAPH_FILE_JSON = "graph.json"
 _CACHE_FILE = "cache/file_hashes.json"
 
 
@@ -63,50 +64,70 @@ class GraphBuilder:
         cache_path.write_text(json.dumps(self._cache, indent=2))
 
     def load_graph(self) -> bool:
-        """Load persisted graph. Returns True if successful."""
-        graph_path = self.out_dir / _GRAPH_FILE
-        if not graph_path.exists():
-            return False
-        try:
-            data = json.loads(graph_path.read_text())
-            self.graph = nx.DiGraph()
-            for node in data.get("nodes", []):
-                nid = node.pop("id")
-                self.graph.add_node(nid, **node)
-            for edge in data.get("edges", []):
-                frm = edge.pop("from")
-                to = edge.pop("to")
-                self.graph.add_edge(frm, to, **edge)
-            return True
-        except Exception as exc:
-            warnings.warn(f"[builder] Failed to load graph: {exc}")
-            return False
+        """Load persisted graph. Try graph.toon first, then graph.json. Returns True if successful."""
+        from . import toon
 
-    def save_graph(self) -> None:
-        """Persist graph to JSON (human-readable)."""
-        graph_path = self.out_dir / _GRAPH_FILE
-        nodes = []
-        for nid, attrs in self.graph.nodes(data=True):
-            node_data = {"id": nid}
-            node_data.update(attrs)
-            nodes.append(node_data)
+        toon_path = self.out_dir / _GRAPH_FILE
+        json_path = self.out_dir / _GRAPH_FILE_JSON
 
-        edges = []
-        for frm, to, attrs in self.graph.edges(data=True):
-            edge_data = {"from": frm, "to": to}
-            edge_data.update(attrs)
-            edges.append(edge_data)
+        if toon_path.exists():
+            try:
+                self.graph, _ = toon.load_graph(toon_path)
+                return True
+            except Exception as exc:
+                warnings.warn(f"[builder] Failed to load {toon_path}: {exc}")
 
-        data = {
-            "meta": {
-                "project_root": str(self.project_root),
-                "node_count": len(nodes),
-                "edge_count": len(edges),
-            },
-            "nodes": nodes,
-            "edges": edges,
+        if json_path.exists():
+            try:
+                data = json.loads(json_path.read_text())
+                self.graph = nx.DiGraph()
+                for node in data.get("nodes", []):
+                    nid = node.pop("id")
+                    self.graph.add_node(nid, **node)
+                for edge in data.get("edges", []):
+                    frm = edge.pop("from")
+                    to = edge.pop("to")
+                    self.graph.add_edge(frm, to, **edge)
+                return True
+            except Exception as exc:
+                warnings.warn(f"[builder] Failed to load graph: {exc}")
+
+        return False
+
+    def save_graph(self, output_format: str = "toon") -> None:
+        """Persist graph (default: TOON format; pass output_format='json' for JSON)."""
+        from . import toon as _toon
+
+        meta = {
+            "project_root": str(self.project_root),
+            "node_count": self.graph.number_of_nodes(),
+            "edge_count": self.graph.number_of_edges(),
         }
-        graph_path.write_text(json.dumps(data, indent=2, default=str))
+
+        if output_format == "toon":
+            graph_path = self.out_dir / _GRAPH_FILE
+            _toon.dump_graph(self.graph, graph_path, meta)
+        else:
+            # JSON format
+            graph_path = self.out_dir / _GRAPH_FILE_JSON
+            nodes = []
+            for nid, attrs in self.graph.nodes(data=True):
+                node_data = {"id": nid}
+                node_data.update(attrs)
+                nodes.append(node_data)
+
+            edges = []
+            for frm, to, attrs in self.graph.edges(data=True):
+                edge_data = {"from": frm, "to": to}
+                edge_data.update(attrs)
+                edges.append(edge_data)
+
+            data = {
+                "meta": meta,
+                "nodes": nodes,
+                "edges": edges,
+            }
+            graph_path.write_text(json.dumps(data, indent=2, default=str))
 
     # ── File discovery ────────────────────────────────────────────────────────
 
@@ -152,12 +173,13 @@ class GraphBuilder:
 
     # ── Build ─────────────────────────────────────────────────────────────────
 
-    def build(self, update_only: bool = False) -> dict[str, Any]:
+    def build(self, update_only: bool = False, output_format: str = "toon") -> dict[str, Any]:
         """
         Scan all infrastructure files and build/update the graph.
 
         Args:
             update_only: If True, skip files whose SHA-256 matches the cache.
+            output_format: 'toon' (default) or 'json'.
 
         Returns:
             Stats dict with counts of nodes, edges, files parsed.
@@ -241,7 +263,7 @@ class GraphBuilder:
         assign_communities(self.graph)
 
         self.save_cache()
-        self.save_graph()
+        self.save_graph(output_format=output_format)
 
         return {
             "nodes": self.graph.number_of_nodes(),

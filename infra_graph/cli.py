@@ -52,7 +52,9 @@ def cli() -> None:
 @click.option("--mode", default="standard", type=click.Choice(["standard", "deep"]),
               help="deep uses graspologic Leiden for community detection")
 @click.option("--watch", is_flag=True, help="Watch for file changes and auto-rebuild")
-def build(path: str, update: bool, mode: str, watch: bool) -> None:
+@click.option("--format", "fmt", default="toon", type=click.Choice(["toon", "json"]),
+              help="Output graph format (default: toon)")
+def build(path: str, update: bool, mode: str, watch: bool, fmt: str) -> None:
     """Build or update the infrastructure knowledge graph."""
     project_root = Path(path).resolve()
     builder = GraphBuilder(project_root)
@@ -61,7 +63,7 @@ def build(path: str, update: bool, mode: str, watch: bool) -> None:
     if update:
         click.echo("Mode: incremental update")
 
-    stats = builder.build(update_only=update)
+    stats = builder.build(update_only=update, output_format=fmt)
 
     click.echo(
         f"Done. nodes={stats['nodes']}, edges={stats['edges']}, "
@@ -72,8 +74,9 @@ def build(path: str, update: bool, mode: str, watch: bool) -> None:
     report_path = generate_report(builder.graph, builder.out_dir, stats)
     click.echo(f"Report: {report_path}")
 
-    graph_json_path = builder.out_dir / "graph.json"
-    click.echo(f"Graph:  {graph_json_path}")
+    graph_file_name = "graph.toon" if fmt == "toon" else "graph.json"
+    graph_path = builder.out_dir / graph_file_name
+    click.echo(f"Graph:  {graph_path}")
 
     if watch:
         _watch_mode(project_root, builder)
@@ -212,7 +215,10 @@ def status(path: str) -> None:
     project_root = Path(path).resolve()
     builder = _get_builder(project_root)
 
-    graph_file = builder.out_dir / "graph.json"
+    # Check for graph.toon first, fall back to graph.json
+    graph_file = builder.out_dir / "graph.toon"
+    if not graph_file.exists():
+        graph_file = builder.out_dir / "graph.json"
     if not graph_file.exists():
         click.echo("No graph built yet. Run `infra-graph build <path>`.")
         return
@@ -260,15 +266,80 @@ def visualize(path: str, open_browser: bool) -> None:
         webbrowser.open(html_path.as_uri())
 
 
+# ── federate ──────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("paths", nargs=-1, required=True, type=click.Path(exists=True))
+@click.option("--output", "-o", default=None,
+              help="Output path (default: ./federated-graph.toon)")
+@click.option("--format", "fmt", default="toon",
+              type=click.Choice(["toon", "json"]))
+def federate(paths: tuple[str, ...], output: str | None, fmt: str) -> None:
+    """Merge multiple repo graph files into a federated cross-repo graph."""
+    import json as _json
+
+    from .graph.federation import federate as _federate
+    from .graph.toon import dump_graph
+
+    # Accept both repo root dirs and direct graph file paths
+    graph_files = []
+    for p in paths:
+        pp = Path(p).resolve()
+        if pp.is_dir():
+            toon_file = pp / "infra-graph-out" / "graph.toon"
+            json_file = pp / "infra-graph-out" / "graph.json"
+            if toon_file.exists():
+                graph_files.append(toon_file)
+            elif json_file.exists():
+                graph_files.append(json_file)
+            else:
+                click.echo(
+                    f"No graph found in {pp}. Run `infra-graph build` first.", err=True
+                )
+                sys.exit(1)
+        else:
+            graph_files.append(pp)
+
+    click.echo(f"Federating {len(graph_files)} graphs...")
+    for f in graph_files:
+        click.echo(f"  {f}")
+
+    graph, meta = _federate(graph_files)
+
+    out_path = Path(output).resolve() if output else Path("./federated-graph.toon").resolve()
+    if fmt == "json":
+        if not str(out_path).endswith(".json"):
+            out_path = out_path.with_suffix(".json")
+        nodes = [{"id": nid, **attrs} for nid, attrs in graph.nodes(data=True)]
+        edges = [{"from": f, "to": t, **d} for f, t, d in graph.edges(data=True)]
+        out_path.write_text(
+            _json.dumps({"meta": meta, "nodes": nodes, "edges": edges}, indent=2, default=str)
+        )
+    else:
+        if not str(out_path).endswith(".toon"):
+            out_path = out_path.with_suffix(".toon")
+        dump_graph(graph, out_path, meta)
+
+    click.echo(f"\nFederated graph: {out_path}")
+    click.echo(f"  nodes={graph.number_of_nodes()}, edges={graph.number_of_edges()}")
+    click.echo(f"  node_count_before={meta.get('total_nodes_before_federation', '?')}")
+    click.echo(f"  unknowns_resolved={meta.get('unknowns_resolved', '?')}")
+    click.echo(f"  provisioned_by_edges={meta.get('provisioned_by_edges', '?')}")
+
+
 # ── serve ─────────────────────────────────────────────────────────────────────
 
 @cli.command()
 @click.option("--path", default=".", type=click.Path(exists=True, file_okay=False))
-def serve(path: str) -> None:
+@click.option("--graph", "graph_path", default=None,
+              type=click.Path(exists=True, dir_okay=False),
+              help="Explicit graph file to serve (overrides default search)")
+def serve(path: str, graph_path: str | None) -> None:
     """Start the MCP stdio server."""
     project_root = Path(path).resolve()
     from .mcp.server import run_server
-    run_server(project_root=project_root)
+    gp = Path(graph_path).resolve() if graph_path else None
+    run_server(project_root=project_root, graph_file=gp)
 
 
 # ── install ───────────────────────────────────────────────────────────────────
@@ -282,22 +353,32 @@ def serve(path: str) -> None:
     help="Target AI assistant platform",
 )
 @click.option("--path", default=".", type=click.Path(exists=True, file_okay=False))
-def install(platform: str, path: str) -> None:
+@click.option(
+    "--federated",
+    default=None,
+    type=click.Path(dir_okay=False),
+    help="Path to a federated graph file; adds infra-graph-federated MCP entry",
+)
+def install(platform: str, path: str, federated: str | None) -> None:
     """Install infra-graph integration files into a project."""
     project_root = Path(path).resolve()
     click.echo(f"Installing infra-graph for {platform} in: {project_root}")
 
+    federated_path = Path(federated).resolve() if federated else None
+
     if platform == "claude-code":
         from .install.claude import install as _install
+        results = _install(project_root, federated_graph=federated_path)
     elif platform == "cursor":
         from .install.cursor import install as _install
+        results = _install(project_root)
     elif platform in ("codex", "opencode"):
         from .install.codex import install as _install
+        results = _install(project_root)
     else:
         click.echo(f"Unknown platform: {platform}", err=True)
         sys.exit(1)
 
-    results = _install(project_root)
     for filename, action in results.items():
         click.echo(f"  {action:10s}  {filename}")
 

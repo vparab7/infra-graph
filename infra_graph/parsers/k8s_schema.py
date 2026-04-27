@@ -295,6 +295,11 @@ class KubernetesParser:
         if kind == "HTTPRoute" and api_version.startswith(_GATEWAY_API_PREFIXES):
             return self._extract_httproute_edges(node_id, spec, namespace)
 
+        # ── ArgoCD Cluster Secret ─────────────────────────────────────────────
+        if kind == "Secret":
+            self._extract_argocd_cluster_secret_attrs(node_id, doc, metadata)
+            return []
+
         return []
 
     # ── Core Kubernetes ────────────────────────────────────────────────────────
@@ -647,6 +652,44 @@ class KubernetesParser:
                         "routes_to", 1.0, "EXTRACTED",
                     ))
         return edges
+
+    # ── ArgoCD Cluster Secret attribute extraction ────────────────────────────
+
+    def _extract_argocd_cluster_secret_attrs(
+        self, node_id: str, doc: dict, metadata: dict
+    ) -> None:
+        """
+        If this Secret has the ArgoCD cluster label, extract server_url and
+        argocd_cluster_name attributes and store them on the node.
+        """
+        labels = _get_labels(metadata)
+        if labels.get("argocd.argoproj.io/secret-type") != "cluster":
+            return
+
+        string_data = doc.get("stringData") or {}
+        spec = doc.get("spec") or {}
+        data = doc.get("data") or {}
+
+        # Try stringData.server first, then spec.server, then base64-decoded data.server
+        server_url: str | None = None
+        if string_data.get("server"):
+            server_url = _safe_str(string_data["server"])
+        elif spec.get("server"):
+            server_url = _safe_str(spec["server"])
+        elif data.get("server"):
+            import base64
+            try:
+                server_url = base64.b64decode(str(data["server"])).decode("utf-8").strip()
+            except Exception:
+                pass
+
+        cluster_name: str | None = _safe_str(string_data.get("name"))
+
+        if node_id in self._all_nodes:
+            if server_url:
+                self._all_nodes[node_id]["server_url"] = server_url
+            if cluster_name:
+                self._all_nodes[node_id]["argocd_cluster_name"] = cluster_name
 
     # ── Selector resolution (cross-file, called after all files parsed) ────────
 
